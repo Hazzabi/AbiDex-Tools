@@ -30,6 +30,10 @@ export interface ConversionResult {
   pages: number;
   chapters: number;
   headings: number;
+  /** Párrafos `<p>` generados (sin contar títulos, listas ni figuras). */
+  paragraphs: number;
+  /** Listas `<ul>`/`<ol>` generadas. */
+  lists: number;
   words: number;
   /** Imágenes incrustadas en el EPUB (sin contar la portada renderizada). */
   images: number;

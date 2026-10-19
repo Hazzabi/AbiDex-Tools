@@ -11,7 +11,7 @@ export const pdfToEpubTool: ToolDefinition = {
   id: 'pdf-to-epub',
   name: 'PDF a EPUB',
   description:
-    'Transforma un PDF de texto en un EPUB 3 reflowable con capítulos e índice.',
+    'Transforma un PDF de texto en un EPUB 3 reflowable con títulos, párrafos, listas e índice.',
   category: 'documents',
   icon: FileText,
   component: PdfToEpubView,

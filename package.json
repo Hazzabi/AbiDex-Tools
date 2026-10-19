@@ -1,7 +1,7 @@
 {
   "name": "abidex-tools",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.3.0",
   "type": "module",
   "description": "Herramientas creadas por Hazzabi para la comodidad de su vida.",
   "scripts": {

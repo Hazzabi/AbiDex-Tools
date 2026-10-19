@@ -5,6 +5,55 @@ Todos los cambios relevantes de este proyecto se documentan en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/)
 y el proyecto sigue [Versionado Semántico](https://semver.org/lang/es/).
 
+## [0.3.0] - 2026-10-19
+
+Tercera versión: la conversión ya no aplana el texto. El EPUB conserva la jerarquía real del
+documento (títulos, subtítulos, párrafos y listas) y los saltos de página.
+
+### Added
+
+- **Análisis tipográfico real**: además del tamaño de fuente se lee el estilo verdadero de cada
+  fuente (`bold`/`black` de pdf.js en `commonObjs`) para reconocer titulares que no cambian de
+  tamaño. Las fuentes se esperan con timeout y se cachean, de modo que la primera página no pierde
+  la negrita mientras pdf.js todavía las envía.
+- **Escalera de tamaños adaptativa**: los tamaños distintos presentes en el documento se ordenan de
+  mayor a menor y se mapean a `h1`, `h2`, `h3`… Un documento con 18/14/12 pt produce tres niveles
+  reales en lugar de aproximaciones por proporción fija.
+- **Párrafos por interlineado**: el interlineado base se calcula como el hueco entre líneas **más
+  frecuente** (moda) y se corta párrafo cuando una línea se separa claramente de él. Se suman dos
+  señales más: primera línea con sangría y, en texto justificado, renglón corto de cierre.
+- **Listas**: se detectan viñetas (`•`, `·`, `▪`, `■`, `◆`, `‣`…) y numeraciones (`1.`, `2)`, `a)`,
+  `iv.`) y se generan `<ul>`/`<ol>` reales, uniendo los renglones de continuación por su sangría
+  colgante y descartando falsos positivos como fechas al inicio de frase.
+- **Saltos de página**: cada hoja cerrada deja un marcador `<div class="page-break"
+  epub:type="pagebreak" role="doc-pagebreak" id="page-N">` con su número, para que se vea dónde
+  terminaba cada página del PDF original.
+- **Orden de lectura por XY-cut**: se reordena cada página con cortes recursivos horizontales
+  (secciones) y verticales (columnas), así los PDFs a dos columnas se leen columna a columna en
+  lugar de línea a línea intercalada. Un grupo nuevo (columna o sección) nunca continúa el párrafo
+  del anterior.
+- **Nuevas estadísticas**: párrafos y listas generadas, junto a las ya existentes.
+
+### Changed
+
+- Las líneas de una misma fila separadas por un hueco horizontal grande (otra columna o celda) ya no
+  se fusionan: cada una es un segmento con su posición real.
+- El CSS del EPUB incorpora estilos para listas y para el separador de salto de página, y evita la
+  sangría de primera línea tras un título, una lista o una figura.
+
+### Fixed
+
+- Las líneas de continuación de una lista (sangría colgante) ya no se interpretan como un párrafo
+  nuevo.
+- Un titular partido en dos renglones ya no abre dos capítulos: se une al encabezado anterior.
+
+### Known limitations
+
+- Las listas con guion (`-`, `–`, `—`) no se consideran listas, porque en castellano el guion largo
+  abre los diálogos; se mantienen como texto.
+
+---
+
 ## [0.2.0] - 2026-10-19
 
 Segunda versión: el EPUB por fin se lee como un libro y el proyecto pasa a llamarse AbiDex-Tools.

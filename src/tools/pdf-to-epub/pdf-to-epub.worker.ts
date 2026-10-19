@@ -2,10 +2,10 @@
  * Worker de conversión PDF → EPUB 3.
  *
  * Vive en su propio hilo (GUIDELINES.md §R2): `pdfjs-dist` extrae el texto y
- * las imágenes, las heurísticas de reflow agrupan líneas y párrafos en
- * capítulos definidos por encabezados (no por páginas), la primera hoja se
- * renderiza como portada y `jszip` construye el contenedor EPUB. Nada de esto
- * toca el DOM ni la red.
+ * las imágenes, un analizador tipográfico reconstruye la estructura del
+ * documento (títulos por tamaño y peso de fuente, párrafos por interlineado y
+ * sangría, listas por marcadores, salto de página) y `jszip` construye el
+ * contenedor EPUB. Nada de esto toca el DOM ni la red.
  */
 import * as pdfjsLib from 'pdfjs-dist';
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
@@ -60,6 +60,7 @@ const ctx = self as unknown as {
 };
 
 const NO_CONTENT_ERROR = 'PdfToEpub:no-content';
+/** Banda superior/inferior donde suelen vivir cabeceras, pies y numeración. */
 const EDGE_MARGIN = 0.08;
 const MAX_TITLE_LENGTH = 300;
 const MAX_AUTHOR_LENGTH = 200;
@@ -69,6 +70,9 @@ const MAX_IMAGES = 250;
 const FALLBACK_CHAPTER_WORDS = 900;
 /** Alto objetivo en píxeles del render de portada. */
 const COVER_TARGET_HEIGHT = 1440;
+/** Un titular no suele superar este tamaño: si lo supera es texto corrido. */
+const HEADING_MAX_WORDS = 16;
+const HEADING_MAX_CHARS = 120;
 
 /* ------------------------------------------------------------------ *
  * Tipos internos
@@ -81,6 +85,14 @@ interface MutableLine {
   lastEnd: number;
   y: number;
   sizes: Map<number, number>;
+  chars: number;
+  boldChars: number;
+}
+
+/** Estilo real de una fuente tal y como lo reporta pdf.js. */
+interface FontStyle {
+  bold: boolean;
+  black: boolean;
 }
 
 interface TextLine {
@@ -94,6 +106,8 @@ interface TextLine {
   topRatio: number;
   isEdge: boolean;
   keep: boolean;
+  /** Negrita/black dominante de la línea (≥ 60 % de sus caracteres). */
+  bold: boolean;
 }
 
 interface PageText {
@@ -101,11 +115,14 @@ interface PageText {
   lines: TextLine[];
 }
 
-type BlockType = 'h1' | 'h2' | 'h3' | 'p' | 'img';
+type HeadingType = 'h1' | 'h2' | 'h3';
+type BlockType = HeadingType | 'p' | 'img' | 'ul' | 'ol' | 'pagebreak';
 
 interface Block {
   type: BlockType;
   text: string;
+  /** Elementos de una lista (`ul`/`ol`). */
+  items?: string[];
   /** Solo para `img`: ruta relativa dentro de OEBPS. */
   src?: string;
   alt?: string;
@@ -118,6 +135,35 @@ interface Chapter {
   pageNumber: number;
   title: string;
   blocks: Block[];
+}
+
+/** Medidas tipográficas globales del documento. */
+interface Typography {
+  /** Tamaño de fuente del cuerpo (moda ponderada por caracteres). */
+  bodySize: number;
+  /** Distancia media entre líneas consecutivas (interlineado del cuerpo). */
+  leading: number;
+  /** Proporción de caracteres en negrita dentro del cuerpo. */
+  bodyBoldRate: number;
+  /**
+   * Escalera de tamaños de titular detectada, de mayor a menor. El primero
+   * se convierte en `h1`, el segundo en `h2` y el resto en `h3`, de modo que
+   * un documento 18/14/12 se traduzca en tres niveles reales.
+   */
+  headingSizes: number[];
+}
+
+/** Medidas de una página concreta para decidir cortes de párrafo. */
+interface PageContext {
+  bodySize: number;
+  leading: number;
+  leftEdge: number;
+  rightEdge: number;
+  /** `true` si el texto está justificado (renglones terminan a la misma altura). */
+  justified: boolean;
+  /** `true` si la negrita a tamaño de cuerpo puede considerarse un titular. */
+  allowBoldHeadings: boolean;
+  headingSizes: number[];
 }
 
 /** Imagen ya codificada y lista para el contenedor EPUB. */
@@ -144,10 +190,16 @@ interface RawImage {
 
 interface TextItemLike {
   str: string;
+  fontName?: string;
   transform?: number[];
   width?: number;
   height?: number;
   hasEOL?: boolean;
+}
+
+interface PdfObjectStore {
+  get(objId: string, callback?: (data: unknown) => void): unknown;
+  has(objId: string): boolean;
 }
 
 /* ------------------------------------------------------------------ *
@@ -222,6 +274,24 @@ function supportsOffscreenCanvas(): boolean {
   return typeof OffscreenCanvas === 'function';
 }
 
+function median(values: readonly number[]): number {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const middle = sorted.length >> 1;
+  return sorted.length % 2 === 1 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+}
+
+/** Une dos fragmentos respetando el guion de partición al final del primero. */
+function joinText(left: string, right: string): string {
+  const cleanRight = cleanText(right);
+  if (!left) return cleanRight;
+  if (!cleanRight) return left;
+  if (/[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]-$/.test(left) && /^[a-záéíóúüñ]/.test(cleanRight)) {
+    return `${left.slice(0, -1)}${cleanRight}`;
+  }
+  return `${left} ${cleanRight}`;
+}
+
 /* ------------------------------------------------------------------ *
  * 1. Extracción: fragmentos de pdf.js → líneas legibles
  * ------------------------------------------------------------------ */
@@ -233,6 +303,93 @@ function effectiveFontSize(transform: number[], height?: number): number {
   if (fromMatrix > 0.5) return fromMatrix;
   if (typeof height === 'number' && height > 0.5) return height;
   return 10;
+}
+
+/**
+ * Recupera el estilo real (negrita/black) de cada fuente usada en la página.
+ * pdf.js publica los objetos de fuente en `commonObjs` de forma asíncrona
+ * (los envía al vuelo con los primeros textos), así que se espera a que
+ * lleguen con un timeout corto y se cachea el resultado. Si una fuente nunca
+ * se resuelve, la línea se clasifica solo por tamaño.
+ */
+const fontStyleCache = new Map<string, FontStyle>();
+
+function styleFromFont(font: { bold?: boolean; black?: boolean } | null | undefined): FontStyle {
+  return { bold: Boolean(font?.bold), black: Boolean(font?.black) };
+}
+
+async function readFontStyles(
+  page: { commonObjs: PdfObjectStore },
+  items: readonly unknown[],
+  timeoutMs = 400,
+): Promise<Map<string, FontStyle>> {
+  const styles = new Map<string, FontStyle>();
+  const pending: string[] = [];
+
+  for (const raw of items) {
+    if (!raw || typeof raw !== 'object') continue;
+    const name = (raw as TextItemLike).fontName;
+    if (typeof name !== 'string' || !name || styles.has(name)) continue;
+
+    const cached = fontStyleCache.get(name);
+    if (cached) {
+      styles.set(name, cached);
+      continue;
+    }
+
+    let resolved = false;
+    try {
+      if (page.commonObjs.has(name)) {
+        const style = styleFromFont(
+          page.commonObjs.get(name) as { bold?: boolean; black?: boolean } | null,
+        );
+        fontStyleCache.set(name, style);
+        styles.set(name, style);
+        resolved = true;
+      }
+    } catch {
+      // Sin datos de fuente: se clasifica por tamaño.
+    }
+    if (!resolved) pending.push(name);
+  }
+
+  await Promise.all(
+    pending.map(
+      (name) =>
+        new Promise<void>((resolve) => {
+          let settled = false;
+          const finish = (style: FontStyle | null): void => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            if (style) {
+              fontStyleCache.set(name, style);
+              styles.set(name, style);
+            }
+            resolve();
+          };
+          const timer = setTimeout(() => finish(null), timeoutMs);
+
+          try {
+            if (page.commonObjs.has(name)) {
+              finish(
+                styleFromFont(
+                  page.commonObjs.get(name) as { bold?: boolean; black?: boolean } | null,
+                ),
+              );
+            } else {
+              page.commonObjs.get(name, (data) => {
+                finish(styleFromFont(data as { bold?: boolean; black?: boolean } | null));
+              });
+            }
+          } catch {
+            finish(null);
+          }
+        }),
+    ),
+  );
+
+  return styles;
 }
 
 function finalizeLine(line: MutableLine, pageHeight: number): TextLine | null {
@@ -267,10 +424,15 @@ function finalizeLine(line: MutableLine, pageHeight: number): TextLine | null {
     topRatio,
     isEdge: (topRatio < EDGE_MARGIN || topRatio > 1 - EDGE_MARGIN) && text.length <= 90,
     keep: true,
+    bold: line.chars > 0 && line.boldChars >= line.chars * 0.6,
   };
 }
 
-function buildLines(items: readonly unknown[], pageHeight: number): TextLine[] {
+function buildLines(
+  items: readonly unknown[],
+  pageHeight: number,
+  fontStyles: Map<string, FontStyle>,
+): TextLine[] {
   const lines: TextLine[] = [];
   let current: MutableLine | null = null;
   let pendingSpace = false;
@@ -305,7 +467,13 @@ function buildLines(items: readonly unknown[], pageHeight: number): TextLine[] {
         : text.length * size * 0.5;
 
     const tolerance = Math.max(1.5, size * 0.45);
-    if (!current || Math.abs(current.y - y) > tolerance) flush();
+    // Un salto horizontal grande en la misma fila no es un espacio: es otra
+    // columna o celda de la página, así que empieza una línea aparte.
+    const segmentGap = size * 3.5;
+    const startsNewSegment =
+      Boolean(current) &&
+      (x < current!.xStart - size * 0.5 || x - current!.lastEnd > segmentGap);
+    if (!current || Math.abs(current.y - y) > tolerance || startsNewSegment) flush();
 
     if (!current) {
       current = {
@@ -315,6 +483,8 @@ function buildLines(items: readonly unknown[], pageHeight: number): TextLine[] {
         lastEnd: x + width,
         y,
         sizes: new Map(),
+        chars: 0,
+        boldChars: 0,
       };
     }
 
@@ -334,8 +504,14 @@ function buildLines(items: readonly unknown[], pageHeight: number): TextLine[] {
     current.xEnd = Math.max(current.xEnd, x + width);
     current.lastEnd = x + width;
 
+    const style = item.fontName ? fontStyles.get(item.fontName) : undefined;
+    const isBold = Boolean(style?.bold || style?.black);
+
     const chars = text.replace(/\s/g, '').length || text.length;
     current.sizes.set(size, (current.sizes.get(size) ?? 0) + chars);
+    current.chars += chars;
+    if (isBold) current.boldChars += chars;
+
     pendingSpace = false;
 
     if (item.hasEOL) flush();
@@ -346,7 +522,7 @@ function buildLines(items: readonly unknown[], pageHeight: number): TextLine[] {
 }
 
 /* ------------------------------------------------------------------ *
- * 2. Heurísticas: encabezados/pies repetidos y tamaño de cuerpo
+ * 2. Heurísticas: cabeceras/pies, tipografía, títulos, listas y párrafos
  * ------------------------------------------------------------------ */
 
 function normalizeEdgeKey(text: string): string {
@@ -401,111 +577,360 @@ function removeRepeatedEdgeLines(pages: PageText[]): void {
   }
 }
 
-/** Mediana ponderada por caracteres de los tamaños de fuente del cuerpo. */
-function computeBodyFontSize(pages: PageText[]): number {
+/**
+ * Medidas tipográficas del documento:
+ * - `bodySize`: moda de tamaños ponderada por caracteres (el cuerpo domina).
+ * - `leading`: hueco entre líneas más frecuente (el interlineado base; las
+ *   separaciones de párrafo son menos numerosas que las líneas corridas).
+ * - `bodyBoldRate`: proporción de caracteres en negrita dentro del cuerpo.
+ */
+function computeTypography(pages: PageText[]): Typography {
   const weights = new Map<number, number>();
+  const boldWeights = new Map<number, number>();
+  const gaps: number[] = [];
 
   for (const page of pages) {
-    for (const line of page.lines) {
-      if (!line.keep || line.isEdge) continue;
+    const lines = page.lines
+      .filter((line) => line.keep && !line.isEdge && line.text.length > 0)
+      .sort((a, b) => b.y - a.y);
+
+    for (const line of lines) {
       const size = Math.round(line.fontSize * 2) / 2;
       weights.set(size, (weights.get(size) ?? 0) + line.charCount);
+      if (line.bold) {
+        boldWeights.set(size, (boldWeights.get(size) ?? 0) + line.charCount);
+      }
+    }
+
+    for (let index = 1; index < lines.length; index += 1) {
+      const gap = lines[index - 1].y - lines[index].y;
+      if (gap > 0.5) gaps.push(gap);
     }
   }
 
-  if (weights.size === 0) return 12;
-
-  const entries = [...weights.entries()].sort((a, b) => a[0] - b[0]);
-  const total = entries.reduce((sum, [, weight]) => sum + weight, 0);
-  let accumulated = 0;
-
-  for (const [size, weight] of entries) {
-    accumulated += weight;
-    if (accumulated >= total / 2) return size;
+  let bodySize = 12;
+  let best = -1;
+  for (const [size, weight] of [...weights.entries()].sort((a, b) => a[0] - b[0])) {
+    if (weight > best) {
+      best = weight;
+      bodySize = size;
+    }
   }
 
-  return entries[entries.length - 1][0];
+  // Interlineado base: moda de los huecos con un tamaño razonable (evita
+  // saltos entre secciones o columnas). Empate → el hueco más pequeño.
+  const buckets = new Map<number, number>();
+  for (const gap of gaps) {
+    if (gap < bodySize * 0.6 || gap > bodySize * 3) continue;
+    const bucket = Math.round(gap * 2) / 2;
+    buckets.set(bucket, (buckets.get(bucket) ?? 0) + 1);
+  }
+  let leading = bodySize * 1.2;
+  let leadingCount = 0;
+  for (const [gap, occurrences] of [...buckets.entries()].sort((a, b) => a[0] - b[0])) {
+    if (occurrences > leadingCount) {
+      leadingCount = occurrences;
+      leading = gap;
+    }
+  }
+  if (buckets.size === 0 && gaps.length > 0) leading = median(gaps);
+
+  const totalChars = [...weights.values()].reduce((sum, weight) => sum + weight, 0) || 1;
+  const boldChars = boldWeights.get(bodySize) ?? 0;
+
+  // Escalera de titulares: tamaños claramente mayores que el cuerpo, con
+  // presencia suficiente para no confundirse con una letra capital o un
+  // cartel aislado. El orden define la jerarquía (h1 → h2 → h3…).
+  const minimumWeight = Math.max(24, totalChars * 0.003);
+  const headingSizes = [...weights.entries()]
+    .filter(([size, weight]) => size >= bodySize * 1.08 && weight >= minimumWeight)
+    .sort((a, b) => b[0] - a[0])
+    .map(([size]) => size);
+
+  return {
+    bodySize,
+    leading,
+    bodyBoldRate: boldChars / totalChars,
+    headingSizes: headingSizes.slice(0, 4),
+  };
 }
 
-function headingLevel(line: TextLine, bodySize: number): BlockType | null {
-  const text = line.text.trim();
-  if (!text || text.length > 180) return null;
-  // Un titular no suele terminar en punto o coma, y una línea de cuerpo no
-  // supera el 114 % del tamaño dominante del documento.
-  if (/[.,;:]$/.test(text)) return null;
+function pageContext(active: TextLine[], typography: Typography): PageContext {
+  const bodyish = active.filter((line) => line.fontSize <= typography.bodySize * 1.1);
+  const pool = bodyish.length >= 3 ? bodyish : active;
 
-  const ratio = line.fontSize / Math.max(bodySize, 1);
-  if (ratio >= 1.75) return 'h1';
-  if (ratio >= 1.35) return 'h2';
-  if (ratio >= 1.14) return 'h3';
+  const leftEdge = Math.min(...pool.map((line) => line.xStart));
+  const rightEdge = Math.max(...pool.map((line) => line.xEnd));
+  const wide = pool.filter((line) => line.xEnd >= rightEdge - typography.bodySize * 0.9).length;
+
+  return {
+    bodySize: typography.bodySize,
+    leading: typography.leading,
+    leftEdge,
+    rightEdge,
+    justified: pool.length >= 4 && wide / pool.length >= 0.55,
+    allowBoldHeadings: typography.bodyBoldRate < 0.35,
+    headingSizes: typography.headingSizes,
+  };
+}
+
+/**
+ * ¿Empieza aquí un párrafo nuevo? Tres señales, de más a menos fiable:
+ * 1. El hueco vertical supera claramente el interlineado (espaciado entre párrafos).
+ * 2. La línea arranca con sangría y la anterior estaba al margen.
+ * 3. Texto justificado: la anterior es un renglón corto (cierre de párrafo).
+ */
+function breaksParagraph(previous: TextLine, line: TextLine, context: PageContext): boolean {
+  const gap = previous.y - line.y;
+  if (gap <= 0) return false;
+
+  if (gap >= context.leading * 1.45) return true;
+
+  const atLeftEdge = line.xStart - context.leftEdge <= context.bodySize * 0.4;
+  const indented = line.xStart - context.leftEdge > context.bodySize * 0.7;
+  const previousAtLeftEdge = previous.xStart - context.leftEdge <= context.bodySize * 0.45;
+
+  if (indented && previousAtLeftEdge) return true;
+
+  if (
+    context.justified &&
+    atLeftEdge &&
+    previous.xEnd < context.rightEdge - context.bodySize * 1.6
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+/** Solo el hueco vertical: la sangría colgante de una lista no es un corte. */
+function hasParagraphGap(previous: TextLine, line: TextLine, context: PageContext): boolean {
+  return previous.y - line.y >= context.leading * 1.45;
+}
+
+/**
+ * Clasifica una línea como titular usando el tamaño relativo al cuerpo y la
+ * negrita real de la fuente. `isolated` significa que la línea empieza y
+ * termina un párrafo (nada la continúa), requisito para aceptar un titular
+ * que solo se distingue por estar en negrita.
+ */
+function classifyHeading(
+  line: TextLine,
+  context: PageContext,
+  isolated: boolean,
+): HeadingType | null {
+  const text = cleanText(line.text);
+  if (!text || text.length > 200) return null;
+  // El cuerpo nunca termina en punto/coma dentro de una misma línea partida;
+  // los titulares tampoco suelen hacerlo.
+  if (/[.,;]$/.test(text)) return null;
+
+  const words = text.split(/\s+/).length;
+  const short = words <= HEADING_MAX_WORDS && text.length <= HEADING_MAX_CHARS;
+
+  // 1) Escalera de tamaños del documento: el nivel sale del rango del tamaño.
+  const rounded = Math.round(line.fontSize * 2) / 2;
+  const rank = context.headingSizes.indexOf(rounded);
+  if (rank === 0) return words <= 24 ? 'h1' : null;
+  if (rank === 1) return short ? 'h2' : null;
+  if (rank > 1) return short ? 'h3' : null;
+
+  // 2) Sin escalera (documento de un solo tamaño): proporción y negrita.
+  const ratio = line.fontSize / Math.max(context.bodySize, 1);
+  if (ratio >= 1.7) return words <= 24 ? 'h1' : null;
+  if (ratio >= 1.3) return short ? 'h2' : null;
+  if (ratio >= 1.1) return short ? 'h3' : null;
+
+  const boldHeading =
+    isolated &&
+    context.allowBoldHeadings &&
+    line.bold &&
+    words <= 12 &&
+    text.length <= 80 &&
+    !/[.:]$/.test(text);
+  if (boldHeading) return 'h3';
+
+  return null;
+}
+
+const BULLET_MARKER = /^([•·▪▫◦‣∙■□◆◇❖※★])\s+/;
+const ORDERED_MARKER = /^(\(?\d{1,3}[.)]|\(?[A-Za-z][.)]|\(?[ivxlcdIVXLCD]{1,6}[.)])\s+/;
+
+/** Detecta el marcador de un elemento de lista y devuelve su texto útil. */
+function detectListMarker(raw: string): { kind: 'ul' | 'ol'; body: string } | null {
+  const text = raw.trim();
+  if (text.length < 2 || text.length > 400) return null;
+
+  const bullet = BULLET_MARKER.exec(text);
+  if (bullet) {
+    const body = text.slice(bullet[0].length).trim();
+    if (body) return { kind: 'ul', body };
+  }
+
+  const ordered = ORDERED_MARKER.exec(text);
+  if (ordered) {
+    const body = text.slice(ordered[0].length).trim();
+    // "3.14 es el valor…" empieza por dígito: es prosa, no una lista.
+    if (body && !/^\d/.test(body)) return { kind: 'ol', body };
+  }
+
   return null;
 }
 
 /* ------------------------------------------------------------------ *
- * 3. Reflow: líneas → bloques de párrafo y encabezado
+ * 3. Orden de lectura (XY-cut) y reflow: líneas → bloques
  * ------------------------------------------------------------------ */
+
+/**
+ * Reordena las líneas de una página a orden de lectura con cortes
+ * recursivos (XY-cut): primero por huecos verticales que atraviesan el
+ * ancho (secciones) y después por canaletas verticales sin solapamiento
+ * (columnas). Devuelve los grupos resultantes en orden; un grupo nuevo
+ * (otra columna, otra sección) nunca continúa un párrafo del anterior.
+ */
+function orderGroups(lines: TextLine[], typography: Typography): TextLine[][] {
+  const byReading = (a: TextLine, b: TextLine): number => b.y - a.y || a.xStart - b.xStart;
+
+  const walk = (items: TextLine[], depth: number): TextLine[][] => {
+    if (items.length <= 2 || depth > 6) return [[...items].sort(byReading)];
+
+    const minX = Math.min(...items.map((line) => line.xStart));
+    const maxX = Math.max(...items.map((line) => line.xEnd));
+    const width = Math.max(1, maxX - minX);
+    const sorted = [...items].sort(byReading);
+
+    // 1) Corte horizontal: hueco vertical amplio que no parte ninguna línea.
+    const horizontalGap = Math.max(typography.leading * 2.2, typography.bodySize * 1.9);
+    for (let index = 1; index < sorted.length; index += 1) {
+      const gap = sorted[index - 1].y - sorted[index].y;
+      if (gap <= horizontalGap) continue;
+
+      const above = sorted.slice(0, index);
+      const below = sorted.slice(index);
+      const aboveMin = Math.min(...above.map((line) => line.xStart));
+      const aboveMax = Math.max(...above.map((line) => line.xEnd));
+      const belowMin = Math.min(...below.map((line) => line.xStart));
+      const belowMax = Math.max(...below.map((line) => line.xEnd));
+      const overlap = Math.min(aboveMax, belowMax) - Math.max(aboveMin, belowMin);
+
+      if (overlap > width * 0.35) {
+        return [...walk(above, depth + 1), ...walk(below, depth + 1)];
+      }
+    }
+
+    // 2) Corte vertical: canaleta donde ninguna línea se solapa.
+    const gutters = [...new Set(items.map((line) => line.xStart))].sort((a, b) => a - b);
+    for (const gutter of gutters) {
+      if (gutter - minX < width * 0.22 || maxX - gutter < width * 0.22) continue;
+
+      const tolerance = typography.bodySize * 0.6;
+      const left = items.filter((line) => line.xEnd <= gutter + tolerance);
+      const right = items.filter((line) => line.xStart >= gutter - tolerance);
+      if (left.length + right.length !== items.length) continue;
+      if (left.length < 2 || right.length < 2) continue;
+
+      return [...walk(left, depth + 1), ...walk(right, depth + 1)];
+    }
+
+    return [sorted];
+  };
+
+  return walk(lines, 0);
+}
 
 /** Bloque sin anclar todavía a una página concreta. */
 type LooseBlock = Omit<Block, 'page'>;
 
-function buildBlocks(lines: TextLine[], bodySize: number): LooseBlock[] {
+function buildBlocks(lines: TextLine[], context: PageContext): LooseBlock[] {
   const blocks: LooseBlock[] = [];
-  const active = lines.filter((line) => line.keep && line.text.length > 0);
-  if (active.length === 0) return blocks;
+  if (lines.length === 0) return blocks;
 
-  let maxWidth = 0;
-  let leftMost = Number.POSITIVE_INFINITY;
-  for (const line of active) {
-    maxWidth = Math.max(maxWidth, line.xEnd - line.xStart);
-    leftMost = Math.min(leftMost, line.xStart);
-  }
-  if (!Number.isFinite(leftMost)) leftMost = 0;
-
-  let buffer = '';
-  let previous: TextLine | null = null;
-
-  const flush = () => {
-    const text = cleanText(buffer);
-    if (text) blocks.push({ type: 'p', text });
-    buffer = '';
+  const breaks: boolean[] = lines.map(
+    (line, index) => index === 0 || breaksParagraph(lines[index - 1], line, context),
+  );
+  const isIsolated = (index: number): boolean => {
+    const before = index === 0 || breaks[index];
+    const after = index === lines.length - 1 || breaks[index + 1];
+    return before && after;
   };
 
-  for (const line of active) {
-    const level = headingLevel(line, bodySize);
+  let paragraph = '';
+  let paragraphLine: TextLine | null = null;
+  let list: { type: 'ul' | 'ol'; items: string[] } | null = null;
+  let listItemStart = 0;
+  let listLine: TextLine | null = null;
+
+  const flushParagraph = () => {
+    const text = cleanText(paragraph);
+    if (text) blocks.push({ type: 'p', text });
+    paragraph = '';
+    paragraphLine = null;
+  };
+
+  const flushList = () => {
+    if (list && list.items.length > 0) blocks.push({ type: list.type, text: '', items: list.items });
+    list = null;
+    listLine = null;
+  };
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+
+    const level = classifyHeading(line, context, isIsolated(index));
     if (level) {
-      flush();
+      flushParagraph();
+      flushList();
+      // Un titular partido en dos renglones no debe abrir dos capítulos: si
+      // el anterior ya era un encabezado del mismo nivel y este continúa sin
+      // separación, se une a él.
+      const previousBlock = blocks[blocks.length - 1];
+      if (!breaks[index] && previousBlock && previousBlock.type === level) {
+        previousBlock.text = joinText(previousBlock.text, line.text);
+        continue;
+      }
       blocks.push({ type: level, text: cleanText(line.text) });
-      previous = line;
       continue;
     }
 
-    if (buffer && previous) {
-      const gap = previous.y - line.y;
-      const endsHyphenated = /-$/.test(buffer) && /^[a-záéíóúüñ]/.test(line.text);
-      const indented = line.xStart - leftMost > bodySize * 0.75;
-      const bigGap = gap > bodySize * 1.5;
-      const previousShort =
-        previous.xEnd - previous.xStart < maxWidth * 0.6 && gap > bodySize * 0.55;
-      const outdented = line.xStart < previous.xStart - bodySize * 0.4;
-
-      if (!endsHyphenated && (bigGap || indented || previousShort || outdented)) {
-        flush();
+    const marker = detectListMarker(line.text);
+    if (marker) {
+      flushParagraph();
+      if (!list || list.type !== marker.kind) {
+        flushList();
+        list = { type: marker.kind, items: [] };
       }
+      list.items.push(cleanText(marker.body));
+      listItemStart = line.xStart;
+      listLine = line;
+      continue;
     }
 
-    if (!buffer) {
-      buffer = cleanText(line.text);
-    } else if (/[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]-$/.test(buffer) && /^[a-záéíóúüñ]/.test(line.text)) {
-      // Palabra partida por guion al final de línea: se une sin espacio.
-      buffer = `${buffer.slice(0, -1)}${cleanText(line.text)}`;
-    } else {
-      buffer = `${buffer} ${cleanText(line.text)}`;
+    if (list && listLine) {
+      // Continuación de un elemento (sangría colgante tras el marcador).
+      const continuesItem =
+        line.xStart >= listItemStart + context.bodySize * 0.5 &&
+        !hasParagraphGap(listLine, line, context);
+      if (continuesItem) {
+        list.items[list.items.length - 1] = joinText(
+          list.items[list.items.length - 1],
+          line.text,
+        );
+        listLine = line;
+        continue;
+      }
+      flushList();
     }
 
-    previous = line;
+    if (paragraph && paragraphLine && breaksParagraph(paragraphLine, line, context)) {
+      flushParagraph();
+    }
+
+    paragraph = paragraph ? joinText(paragraph, line.text) : cleanText(line.text);
+    paragraphLine = line;
   }
 
-  flush();
+  flushParagraph();
+  flushList();
   return blocks;
 }
 
@@ -626,7 +1051,7 @@ async function encodeImage(raw: RawImage): Promise<ImageAsset | null> {
  * no colgar la conversión si un recurso nunca llega.
  */
 function waitForImageObject(
-  page: { objs: ImageObjectStore; commonObjs: ImageObjectStore },
+  page: { objs: PdfObjectStore; commonObjs: PdfObjectStore },
   objId: string,
   timeoutMs = 8_000,
 ): Promise<RawImage | null> {
@@ -656,11 +1081,6 @@ function waitForImageObject(
   });
 }
 
-interface ImageObjectStore {
-  get(objId: string, callback?: (data: unknown) => void): unknown;
-  has(objId: string): boolean;
-}
-
 const PAINT_IMAGE_OPS = new Set<number>([
   pdfjsLib.OPS.paintImageXObject,
   pdfjsLib.OPS.paintImageXObjectRepeat,
@@ -671,7 +1091,7 @@ const PAINT_IMAGE_OPS = new Set<number>([
  * codifican a PNG/JPEG ANTES de que `page.cleanup()` cierre los bitmaps.
  */
 async function collectPageImages(
-  page: { objs: ImageObjectStore; commonObjs: ImageObjectStore },
+  page: { objs: PdfObjectStore; commonObjs: PdfObjectStore },
   opList: { fnArray: ArrayLike<number>; argsArray: ArrayLike<ArrayLike<unknown>> },
   remainingQuota: number,
 ): Promise<ImageAsset[]> {
@@ -760,19 +1180,22 @@ async function renderCover(pdf: PdfDocumentLike): Promise<ImageAsset | null> {
  * 5. Capitulación: los encabezados definen los capítulos, no las páginas
  * ------------------------------------------------------------------ */
 
-function buildChapters(pages: PageText[], pageImages: PageImage[]): {
+interface BuildResult {
   chapters: Chapter[];
   headings: number;
+  paragraphs: number;
+  lists: number;
   words: number;
   images: PageImage[];
-} {
+}
+
+function buildChapters(pages: PageText[], pageImages: PageImage[]): BuildResult {
   removeRepeatedEdgeLines(pages);
-  const bodySize = computeBodyFontSize(pages);
+  const typography = computeTypography(pages);
 
   // Flujo global de unidades: bloques de texto + imágenes de cada página (en
   // orden de operadores). Las imágenes se cuelgan al final del contenido de
   // su propia página, que es el orden de lectura en PDFs escaneados.
-  const units: Block[] = [];
   const imagesByPage = new Map<number, Block[]>();
   let figureCount = 0;
 
@@ -790,33 +1213,54 @@ function buildChapters(pages: PageText[], pageImages: PageImage[]): {
     imagesByPage.set(image.pageNumber, list);
   }
 
+  const units: Block[] = [];
+
   for (const page of pages) {
-    for (const loose of buildBlocks(page.lines, bodySize)) {
-      units.push({ ...loose, page: page.pageNumber });
+    const pageUnits: Block[] = [];
+    const active = page.lines.filter((line) => line.keep && line.text.length > 0);
+
+    if (active.length > 0) {
+      const context = pageContext(active, typography);
+      for (const group of orderGroups(active, typography)) {
+        for (const loose of buildBlocks(group, context)) {
+          pageUnits.push({ ...loose, page: page.pageNumber });
+        }
+      }
     }
-    for (const block of imagesByPage.get(page.pageNumber) ?? []) {
-      units.push(block);
-    }
+
+    pageUnits.push(...(imagesByPage.get(page.pageNumber) ?? []));
+    if (pageUnits.length === 0) continue;
+
+    units.push(...pageUnits);
+    // Separador del salto de página: cierra la hoja para que el lector vea
+    // dónde terminaba cada página del PDF (se elimina el de la última hoja).
+    units.push({ type: 'pagebreak', text: String(page.pageNumber), page: page.pageNumber });
   }
+
+  if (units.length > 0 && units[units.length - 1].type === 'pagebreak') units.pop();
 
   const headings = units.filter(
     (unit) => unit.type === 'h1' || unit.type === 'h2' || unit.type === 'h3',
   ).length;
-  const words = units.reduce(
-    (sum, unit) => sum + (unit.type === 'p' ? countWords(unit.text) : 0),
-    0,
-  );
+  const paragraphs = units.filter((unit) => unit.type === 'p').length;
+  const lists = units.filter((unit) => unit.type === 'ul' || unit.type === 'ol').length;
+  const words = units.reduce((sum, unit) => {
+    if (unit.type === 'p') return sum + countWords(unit.text);
+    if (unit.type === 'ul' || unit.type === 'ol') {
+      return sum + (unit.items ?? []).reduce((total, item) => total + countWords(item), 0);
+    }
+    return sum;
+  }, 0);
 
   // Nivel "top" del documento: el primer nivel jerárquico que aparece. Solo
   // los encabezados de ese nivel abren capítulo.
-  const topLevel: typeof units[number]['type'] | null =
-    units.some((unit) => unit.type === 'h1')
-      ? 'h1'
-      : units.some((unit) => unit.type === 'h2')
-        ? 'h2'
-        : units.some((unit) => unit.type === 'h3')
-          ? 'h3'
-          : null;
+  const topLevel: HeadingType | null = units.some((unit) => unit.type === 'h1')
+    ? 'h1'
+    : units.some((unit) => unit.type === 'h2')
+      ? 'h2'
+      : units.some((unit) => unit.type === 'h3')
+        ? 'h3'
+        : null;
 
   const chapters: Chapter[] = [];
   const firstPage = pages[0]?.pageNumber ?? 1;
@@ -831,6 +1275,10 @@ function buildChapters(pages: PageText[], pageImages: PageImage[]): {
 
     const close = () => {
       if (currentBlocks.length === 0) return;
+      while (currentBlocks.length > 0 && currentBlocks[currentBlocks.length - 1].type === 'pagebreak') {
+        currentBlocks.pop();
+      }
+      if (currentBlocks.length === 0) return;
       chapters.push({
         index: chapters.length + 1,
         pageNumber: chapterStart,
@@ -843,13 +1291,19 @@ function buildChapters(pages: PageText[], pageImages: PageImage[]): {
     };
 
     for (const page of pages) {
-      const pageUnits = units.filter(
-        (unit) => unit.page === page.pageNumber && unit.type === 'p',
-      );
-      if (pageUnits.length === 0) continue;
+      const pageUnits = units.filter((unit) => unit.page === page.pageNumber);
+      const content = pageUnits.filter((unit) => unit.type !== 'pagebreak');
+      if (content.length === 0) continue;
+
       if (currentBlocks.length === 0) chapterStart = page.pageNumber;
       currentBlocks.push(...pageUnits);
-      currentWords += pageUnits.reduce((sum, unit) => sum + countWords(unit.text), 0);
+      currentWords += content.reduce((sum, unit) => {
+        if (unit.type === 'p') return sum + countWords(unit.text);
+        if (unit.type === 'ul' || unit.type === 'ol') {
+          return sum + (unit.items ?? []).reduce((total, item) => total + countWords(item), 0);
+        }
+        return sum;
+      }, 0);
 
       if (currentWords >= FALLBACK_CHAPTER_WORDS) close();
     }
@@ -894,7 +1348,11 @@ function buildChapters(pages: PageText[], pageImages: PageImage[]): {
     for (let index = chapters.length - 1; index >= 0; index -= 1) {
       const chapter = chapters[index];
       const hasContent = chapter.blocks.some(
-        (block) => block.type === 'p' || block.type === 'img',
+        (block) =>
+          block.type === 'p' ||
+          block.type === 'img' ||
+          block.type === 'ul' ||
+          block.type === 'ol',
       );
       if (hasContent) continue;
 
@@ -910,23 +1368,37 @@ function buildChapters(pages: PageText[], pageImages: PageImage[]): {
     }
   }
 
-  return { chapters, headings, words, images: pageImages };
+  return { chapters, headings, paragraphs, lists, words, images: pageImages };
 }
 
 /* ------------------------------------------------------------------ *
  * 6. Generación de archivos EPUB 3
  * ------------------------------------------------------------------ */
 
-function chapterXhtml(chapter: Chapter, language: string): string {
-  const body = chapter.blocks
-    .map((block) => {
-      if (block.type === 'img') {
-        const alt = escapeXml(block.alt ?? 'Figura');
-        return `      <figure><img src="${block.src}" alt="${alt}" /></figure>`;
-      }
+function renderBlock(block: Block): string {
+  switch (block.type) {
+    case 'img': {
+      const alt = escapeXml(block.alt ?? 'Figura');
+      return `      <figure><img src="${block.src}" alt="${alt}" /></figure>`;
+    }
+    case 'ul':
+    case 'ol': {
+      const items = (block.items ?? [])
+        .map((item) => `        <li>${escapeXml(item)}</li>`)
+        .join('\n');
+      return `      <${block.type}>\n${items}\n      </${block.type}>`;
+    }
+    case 'pagebreak': {
+      const label = escapeXml(`Página ${block.text}`);
+      return `      <div class="page-break" epub:type="pagebreak" role="doc-pagebreak" id="page-${escapeXml(block.text)}" title="${label}" aria-label="${label}">· ${escapeXml(block.text)} ·</div>`;
+    }
+    default:
       return `      <${block.type}>${escapeXml(block.text)}</${block.type}>`;
-    })
-    .join('\n');
+  }
+}
+
+function chapterXhtml(chapter: Chapter, language: string): string {
+  const body = chapter.blocks.map(renderBlock).join('\n');
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE html>
@@ -1119,7 +1591,7 @@ function containerXml(): string {
 function styleCss(): string {
   return `@charset "UTF-8";
 
-/* Tipografía fluida y espaciado de párrafos para lectores EPUB 3. */
+/* Tipografía fluida y estructura para lectores EPUB 3. */
 html {
   font-size: 100%;
 }
@@ -1131,7 +1603,7 @@ body {
   font-size: 1em;
   line-height: 1.6;
   color: #111111;
-  text-align: justify;
+  text-align: left;
   hyphens: auto;
   word-wrap: break-word;
 }
@@ -1161,19 +1633,43 @@ h3 {
 }
 
 p {
-  margin: 0 0 0.85em;
-  text-indent: 1.2em;
+  margin: 0 0 0.95em;
+  text-align: justify;
+  text-indent: 0;
+}
+
+p + p {
+  text-indent: 1.3em;
 }
 
 h1 + p,
 h2 + p,
 h3 + p,
-section > p:first-child {
+figure + p,
+ul + p,
+ol + p,
+.page-break + p {
+  text-indent: 0;
+}
+
+ul,
+ol {
+  margin: 0 0 1em;
+  padding-left: 1.6em;
+  text-align: left;
+}
+
+li {
+  margin: 0.35em 0;
+}
+
+li p {
+  margin: 0;
   text-indent: 0;
 }
 
 figure {
-  margin: 1em 0;
+  margin: 1.2em 0;
   text-align: center;
   page-break-inside: avoid;
 }
@@ -1181,6 +1677,19 @@ figure {
 img {
   max-width: 100%;
   height: auto;
+}
+
+/* Separador de salto de página del PDF original. */
+.page-break {
+  margin: 1.6em 0;
+  padding-top: 0.35em;
+  border-top: 1px solid #e2e8f0;
+  color: #94a3b8;
+  font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+  font-size: 0.72em;
+  letter-spacing: 0.22em;
+  text-align: center;
+  text-indent: 0;
 }
 
 section[epub\\:type=\"cover\"] {
@@ -1302,7 +1811,7 @@ async function handleConvert(request: ConversionRequest): Promise<void> {
     disableFontFace: true,
     useSystemFonts: true,
     useWorkerFetch: false,
-    // Recursos locales de pdf.js (fuentes/CMaps/wasm/ICC): todobundle local.
+    // Recursos locales de pdf.js (fuentes/CMaps/wasm/ICC): todo bundle local.
     cMapUrl: `${PDF_ASSETS_BASE}cmaps/`,
     standardFontDataUrl: `${PDF_ASSETS_BASE}standard_fonts/`,
     iccUrl: `${PDF_ASSETS_BASE}iccs/`,
@@ -1323,9 +1832,13 @@ async function handleConvert(request: ConversionRequest): Promise<void> {
       const page = await pdf.getPage(pageNumber);
       const viewport = page.getViewport({ scale: 1 });
       const content = await page.getTextContent();
-      const lines = buildLines(content.items, viewport.height);
+      // La lista de operadores resuelve también los objetos de fuente en
+      // `commonObjs`, que es de donde sale la negrita real de cada línea.
+      const opList = await page.getOperatorList();
+      const fontStyles = await readFontStyles(page, content.items);
+      const lines = buildLines(content.items, viewport.height, fontStyles);
 
-      const assets = await collectPageImages(page, await page.getOperatorList(), MAX_IMAGES - runningNumber);
+      const assets = await collectPageImages(page, opList, MAX_IMAGES - runningNumber);
       for (const asset of assets) {
         runningNumber += 1;
         const extension = asset.mime === 'image/png' ? 'png' : 'jpeg';
@@ -1381,6 +1894,8 @@ async function handleConvert(request: ConversionRequest): Promise<void> {
       pages: total,
       chapters: chapters.length,
       headings: built.headings,
+      paragraphs: built.paragraphs,
+      lists: built.lists,
       words: built.words,
       images: built.images.length,
       cover: cover !== null,

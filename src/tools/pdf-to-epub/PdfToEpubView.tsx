@@ -299,6 +299,8 @@ export function PdfToEpubView() {
       { label: 'Páginas', value: result.pages.toLocaleString('es') },
       { label: 'Capítulos', value: result.chapters.toLocaleString('es') },
       { label: 'Encabezados', value: result.headings.toLocaleString('es') },
+      { label: 'Párrafos', value: result.paragraphs.toLocaleString('es') },
+      { label: 'Listas', value: result.lists.toLocaleString('es') },
       { label: 'Palabras', value: result.words.toLocaleString('es') },
       { label: 'Imágenes', value: result.images.toLocaleString('es') },
       { label: 'Portada', value: result.cover ? 'Generada' : '—' },
@@ -315,8 +317,9 @@ export function PdfToEpubView() {
           <div>
             <h2 className="text-xl font-semibold text-navy">PDF a EPUB</h2>
             <p className="mt-1 max-w-2xl text-sm leading-relaxed text-ink-soft">
-              Convierte un PDF basado en texto en un EPUB 3 reflowable con capítulos según sus
-              encabezados, imágenes incrustadas y portada generada desde la primera hoja.
+              Convierte un PDF basado en texto en un EPUB 3 reflowable que conserva su estructura:
+              títulos y subtítulos, párrafos, listas y saltos de página, con imágenes incrustadas y
+              portada generada desde la primera hoja.
             </p>
           </div>
         </div>
@@ -549,7 +552,7 @@ export function PdfToEpubView() {
                 <CheckCircle2 className="h-5 w-5 text-crimson" aria-hidden="true" />
                 EPUB generado correctamente
               </p>
-              <dl className="mt-4 grid grid-cols-2 gap-3 sm:grid-cols-3">
+              <dl className="mt-4 grid grid-cols-2 gap-3 sm:grid-cols-4">
                 {stats.map((stat) => (
                   <div key={stat.label} className="rounded-xl bg-white/80 px-3 py-2">
                     <dt className="text-[11px] font-semibold uppercase tracking-wide text-ink-muted">
