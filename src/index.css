@@ -1,0 +1,162 @@
+@import 'tailwindcss';
+
+/* ------------------------------------------------------------------ *
+ * Tokens de diseño de LocalToolbox (Tailwind CSS 4 · @theme)
+ * Paleta: blanco puro, azul marino, rojo vibrante y carbón.
+ * ------------------------------------------------------------------ */
+@theme {
+  --font-sans:
+    'Montserrat Variable', 'Montserrat', 'Century Gothic', 'Avenir Next', ui-sans-serif, system-ui,
+    sans-serif;
+
+  --color-navy: #0f172a;
+  --color-navy-soft: #1e293b;
+  --color-navy-muted: #334155;
+
+  --color-crimson: #dc2626;
+  --color-crimson-strong: #e11d48;
+  --color-crimson-deep: #b91c1c;
+
+  --color-ink: #09090b;
+  --color-ink-soft: #3f3f46;
+  --color-ink-muted: #71717a;
+  --color-line: #e4e4e7;
+  --color-line-strong: #d4d4d8;
+  --color-paper: #ffffff;
+
+  --radius-card: 1rem;
+
+  --shadow-card: 0 1px 2px 0 rgb(9 9 11 / 0.04), 0 8px 24px -12px rgb(9 9 11 / 0.12);
+  --shadow-card-hover: 0 2px 4px 0 rgb(9 9 11 / 0.05), 0 18px 40px -18px rgb(15 23 42 / 0.28);
+}
+
+/* ------------------------------------------------------------------ *
+ * Base
+ * ------------------------------------------------------------------ */
+@layer base {
+  html {
+    -webkit-text-size-adjust: 100%;
+    text-size-adjust: 100%;
+  }
+
+  body {
+    background-color: var(--color-paper);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    font-synthesis-weight: none;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  ::selection {
+    background-color: var(--color-crimson);
+    color: #ffffff;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-crimson);
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4 {
+    color: var(--color-navy);
+    letter-spacing: -0.02em;
+    text-wrap: balance;
+  }
+
+  p {
+    text-wrap: pretty;
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * Utilidades compartidas
+ * ------------------------------------------------------------------ */
+@layer utilities {
+  .lt-skip-link {
+    position: absolute;
+    left: -9999px;
+    top: 0.5rem;
+    z-index: 50;
+    padding: 0.5rem 1rem;
+    border: 0;
+    border-radius: 0.5rem;
+    background-color: var(--color-navy);
+    color: #ffffff;
+    font: inherit;
+    font-size: 0.875rem;
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  .lt-skip-link:focus {
+    left: 0.5rem;
+  }
+
+  .animate-rise {
+    animation: lt-rise 0.35s cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+
+  .animate-fade {
+    animation: lt-fade 0.25s ease-out both;
+  }
+
+  .lt-progress-stripes {
+    background-image: linear-gradient(
+      135deg,
+      rgb(255 255 255 / 0.28) 25%,
+      transparent 25%,
+      transparent 50%,
+      rgb(255 255 255 / 0.28) 50%,
+      rgb(255 255 255 / 0.28) 75%,
+      transparent 75%,
+      transparent
+    );
+    background-size: 1rem 1rem;
+    animation: lt-stripes 0.9s linear infinite;
+  }
+}
+
+@keyframes lt-rise {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes lt-fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes lt-stripes {
+  from {
+    background-position: 0 0;
+  }
+  to {
+    background-position: 1rem 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
